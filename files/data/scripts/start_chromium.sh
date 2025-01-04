@@ -15,8 +15,18 @@ CHROMIUM_BINARY="/usr/bin/chromium"
 USER_DATA_DIR="/config"
 DISK_CACHE_DIR="/dev/null"  # prevent chromium from caching anything
 
+IP="10.6.0.21"
+
+# Wait until the host is reachable
+until ping -c 1 "$IP" &> /dev/null; do
+    echo "Waiting for $IP to be reachable..."
+    sleep 1  # Wait for 1 second before retrying
+done
+
 # log this script's actions to a file
 exec 1>/var/log/chromium.log 2>&1
+
+
 
 echo "Starting chromium kiosk"
 
@@ -37,6 +47,9 @@ rm ${USER_DATA_DIR}/SingletonLock
 # here we detect resolution by briefly starting X11 and then parsing output of xrandr
 #	this is simpler and more reliable than parsing xorg.conf
 #	by avoiding a hardcoded resolution here, we only need to make changes in xorg.conf if we want to change resolution or rotate
+# if you have issues where SCALE (--force-device-scale-factor) is not working as expected
+#	try removing --window-size and --window-position arguments completely, and see if chromium will go fullscreen-enough for your use-case
+
 
 echo "Briefly starting X11 in order to detect configured resolution"
 DISP_REZ=$(xinit /usr/bin/xrandr 2>/dev/null|grep "\*"|awk '{print $1}'|tr 'x' ',')

@@ -9,11 +9,13 @@ Buttons monitoring, to integrate with Home Assistant
 # https://github.com/maximehk/ha_lights/blob/main/ha_lights/ha_lights.py
 
 
+import subprocess
 import time
 import struct
 import contextlib
 import warnings
 import logging
+import os
 
 from threading import Thread
 from threading import Event as ThreadEvent
@@ -22,11 +24,12 @@ import requests
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
-from homeassistant_api import Client
+from homeassistant_api import Client, State
 
 # user-configurable settings are all in button_settings.py
-from buttons_settings import ROOM_LIGHT, ROOM_SCENES, ESC_SCENE, LEVEL_INCREMENT
+from buttons_settings import LEVEL_INCREMENT
 from buttons_settings import HA_SERVER, HA_TOKEN
+from buttons_settings import BUTTON1, BUTTON2, BUTTON3, BUTTON4, BUTTON5, BUTTON_ESC
 
 # All the device buttons are part of event0, which appears as a keyboard
 # 	buttons along the edge are: 1, 2, 3, 4, m
@@ -37,6 +40,10 @@ from buttons_settings import HA_SERVER, HA_TOKEN
 
 DEV_BUTTONS = '/dev/input/event0'
 DEV_KNOB = '/dev/input/event1'
+
+BACKLIGHT = "/sys/devices/platform/backlight/backlight/aml-bl/brightness"
+BRIGHTNESS = 100
+
 
 # for event0, these are the keycodes for buttons
 BUTTONS_CODE_MAP = {
@@ -61,6 +68,9 @@ EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 # global for HA Client
 HA_CLIENT:Client = None
 
+DOUBLE_PRESS_THRESHOLD = 0.3 
+media_ctrl = False
+
 # suppress warnings about invalid certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 old_merge_environment_settings = requests.Session.merge_environment_settings
@@ -79,7 +89,18 @@ ch.setLevel(logging.DEBUG)
 ch.setFormatter(logformat)
 logger.addHandler(ch)
 
+current_light = "light.bedroom_lights"
+current_media = 'media_player.lisa'
+muted = {}
+sleep = False
 
+try:
+    with open("/home/superbird/light", "r") as file:
+        current_light = file.read().strip()
+except Exception as e:
+    logger.info(e)
+    
+logger.info(f"Current light is: {current_light}")
 @contextlib.contextmanager
 def no_ssl_verification():
     """
@@ -132,48 +153,199 @@ def translate_event(etype: int, code: int, value: int) -> str:
                 return 'LEFT'
     return 'UNKNOWN'
 
+def toggle_backlight():
+    global sleep
+    data = None
+    with open(BACKLIGHT, 'r') as file:
+        data = int(file.read().rstrip())
+    sleep = not sleep
+    if data == 0:
+        os.system(f"echo 100 > {BACKLIGHT}")
+    else:
+        os.system(f"echo 0 > {BACKLIGHT}")
+    
+def backlight_serivce():
+    global sleep
 
+    while True:
+        # Check the display status using xset
+        try:
+            display_status = subprocess.check_output("DISPLAY=:0 xset -q | grep 'Monitor is' | awk '{print $3}'", shell=True, text=True).strip()
+        except subprocess.CalledProcessError:
+            display_status = "Unknown"
+
+        # Set the backlight brightness based on display status
+        if display_status == "Off" or sleep:
+            with open(BACKLIGHT, "w") as f:
+                f.write("0")
+                os.system("DISPLAY=:0 xinput disable TouchScreen")
+        elif display_status != "Off":
+            with open(BACKLIGHT, "w") as f:
+                f.write(str(BRIGHTNESS))
+                os.system("DISPLAY=:0 xinput enable TouchScreen")
+
+        # Wait before checking again
+        time.sleep(0.1)
+
+def set_current_light(light):
+    global current_light
+    current_light = light
+    HA_CLIENT.set_state(State(entity_id="input_text.current_light", state=current_light))
+    logger.info(f'current light {current_light}')
+    os.system(f'echo "{current_light}" > /home/superbird/light')
+
+def process_key(item):
+    if "light." in item:
+        set_current_light(item)
+        #set_current_light(item)
+    elif "switch." in item:
+        switch_domain = HA_CLIENT.get_domain('switch')
+        switch_domain.toggle(entity_id=item)
+        logger.info(f"Toggling {item}")
+    elif "scene." in item:
+        scene_domain = HA_CLIENT.get_domain('scene')
+        scene_domain.turn_on(entity_id=item)
+        logger.info(f"Running scene {item}")
+    elif "input_button." in item:
+        scene_domain = HA_CLIENT.get_domain('input_button')
+        scene_domain.press(entity_id=item)
+        logger.info(f"Pressing {item}")
+    elif "toggle"==item:
+        global media_ctrl
+        media_ctrl = False if media_ctrl else True
+        logger.info(f"Media control toggled: {media_ctrl}")
+
+    
 def handle_button(pressed_key: str):
     """
     Decide what to do in response to a button press
     """
-    logger.info(f'Pressed button: {pressed_key}')
     # check for presets
     if pressed_key in ['1', '2', '3', '4', 'm']:
+
+        if pressed_key == '1':
+            process_key(BUTTON1[0])
+        if pressed_key == '2':
+            process_key(BUTTON2[0])
+        if pressed_key == '3':
+            process_key(BUTTON3[0])
+        if pressed_key == '4':
+            process_key(BUTTON4[0])
         if pressed_key == 'm':
-            pressed_key = '5'
-        if len(ROOM_SCENES) >= int(pressed_key):
-            preset = ROOM_SCENES[int(pressed_key) - 1]
-            cmd_scene(preset)
+            toggle_backlight()
+            #process_key(BUTTON5[0])
+        
     elif pressed_key in ['ESC', 'ENTER', 'LEFT', 'RIGHT']:
         if pressed_key == 'ENTER':
-            cmd_toggle()
+            if media_ctrl:
+                volume_mute()
+            else:
+                light_toggle(current_light)
         elif pressed_key == 'LEFT':
             cmd_lower()
         elif pressed_key == 'RIGHT':
             cmd_raise()
         if pressed_key == 'ESC':
-            cmd_scene(ESC_SCENE)
+            if media_ctrl:
+                play_pause()
+            else:
+                light_toggle(current_light)
+
+def handle_button_double_press(pressed_key: str):
+    """
+    Decide what to do in response to a button press
+    """
+
+    logger.info(f'Double press: {pressed_key}')
+    # check for presets
+    if pressed_key in ['1', '2', '3', '4', 'm']:
+
+        if pressed_key == '1':
+            process_key(BUTTON1[1])
+        if pressed_key == '2':
+            process_key(BUTTON2[1])
+        if pressed_key == '3':
+            process_key(BUTTON3[1])
+        if pressed_key == '4':
+            process_key(BUTTON4[1])
+        if pressed_key == 'm':
+            process_key(BUTTON5[1])
+        
+    elif pressed_key in ['ESC', 'ENTER', 'LEFT', 'RIGHT']:
+        if pressed_key == 'ENTER':
+            if media_ctrl:
+                pass #volume_mute()
+            else:
+                light_toggle(current_light)
+        elif pressed_key == 'LEFT':
+            cmd_lower()
+        elif pressed_key == 'RIGHT':
+            cmd_raise()
+        if pressed_key == 'ESC':
+            process_key(BUTTON_ESC[1])
 
 
-def get_light_level(entity_id: str) -> int:
+def get_media_player():
+    m = HA_CLIENT.get_entity(entity_id="input_text.current_media")
+    player = m.get_state()
+    if player == "unknown":
+        player = "media_player.lisa"
+    return player.state
+
+def get_volume_level() -> int:
     """
     Get current brightness of a light
     """
-    light = HA_CLIENT.get_entity(entity_id=entity_id)
+    m = HA_CLIENT.get_entity(entity_id=current_media)
+    level = m.get_state().attributes['volume_level']
+    if level is None:
+        level = 0
+    return level
+
+def get_light_level() -> int:
+    """
+    Get current brightness of a light
+    """
+    light = HA_CLIENT.get_entity(entity_id=current_light)
     level = light.get_state().attributes['brightness']
     if level is None:
         level = 0
     return level
 
+def volume_mute():
+    global muted
+    volume = get_volume_level()
+    media_player = get_media_player()
+    is_muted = muted.get(media_player, [False, volume])
+    m = HA_CLIENT.get_domain('media_player')
+    m.volume_set(entity_id=media_player, volume_level=0 if is_muted[0] else is_muted[1])
+    muted[media_player] = [not is_muted[0], volume]
 
-def set_light_level(entity_id: str, level: int):
+def volume_up():
+    m = HA_CLIENT.get_domain('media_player')
+    m.volume_up(entity_id=get_media_player())
+
+def volume_down():
+    m = HA_CLIENT.get_domain('media_player')
+    m.volume_down(entity_id=get_media_player())
+
+def set_light_level(level: int):
     """
     Set light brightness
     """
     light_domain = HA_CLIENT.get_domain('light')
-    light_domain.turn_on(entity_id=entity_id, brightness=level)
+    light_domain.turn_on(entity_id=current_light, brightness=level)
 
+def set_volume_level(level: int):
+    """
+    Set light brightness
+    """
+    m = HA_CLIENT.get_domain('media_player')
+    m.set(entity_id=current_media, volume_level=level)
+
+def play_pause():
+    m = HA_CLIENT.get_domain('media_player')
+    m.media_play_pause(entity_id=get_media_player())
 
 def cmd_scene(entity_id: str):
     """
@@ -188,39 +360,57 @@ def cmd_scene(entity_id: str):
     scene_domain.turn_on(entity_id=entity_id)
 
 
-def cmd_toggle():
+def light_toggle(entiity_id):
     """
     Toggle the light for this room on/off
     """
-    logger.info(f'Toggling state of light: {ROOM_LIGHT}')
     light_domain = HA_CLIENT.get_domain('light')
-    light_domain.toggle(entity_id=ROOM_LIGHT)
+    light_domain.toggle(entity_id=entiity_id)
+    set_current_light(entiity_id)
+    
 
 
 def cmd_lower():
     """
     Lower the level of the light for this room
     """
-    logger.info(f'Lowering brightness of {ROOM_LIGHT}')
-    current_level = get_light_level(ROOM_LIGHT)
+    if media_ctrl:
+        logger.info(f'Lowering volume of {current_media}')
+        volume_down()
+        return
+
+    current_level = get_light_level()
     new_level = current_level - LEVEL_INCREMENT
     new_level = max(new_level, 0)
     logger.info(f'New level: {new_level}')
     if new_level < current_level:
-        set_light_level(ROOM_LIGHT, new_level)
+        set_light_level(new_level)
+
+    logger.info(f'Lowering brightness of {current_light}')
+    current_level = get_light_level()
+    new_level = current_level - LEVEL_INCREMENT
+    new_level = max(new_level, 0)
+    logger.info(f'New level: {new_level}')
+    if new_level < current_level:
+        set_light_level(new_level)
 
 
 def cmd_raise():
     """
     Raise the level of the light for this room
     """
-    logger.info(f'Raising brightness of {ROOM_LIGHT}')
-    current_level = get_light_level(ROOM_LIGHT)
+    if media_ctrl:
+        logger.info(f'Raising volume of {current_media}')
+        volume_up()
+        return
+    
+    logger.info(f'Raising brightness of {current_light}')
+    current_level = get_light_level()
     new_level = current_level + LEVEL_INCREMENT
     new_level = min(new_level, 255)
     logger.info(f'New level: {new_level}')
     if new_level > current_level:
-        set_light_level(ROOM_LIGHT, new_level)
+        set_light_level( new_level)
 
 
 class EventListener():
@@ -231,6 +421,8 @@ class EventListener():
         self.device = device
         self.stopper = ThreadEvent()
         self.thread:Thread = None
+        self.last_press_times = {}  # Store last press times for buttons
+        self.press_flags = {}
         self.start()
 
     def start(self):
@@ -249,29 +441,74 @@ class EventListener():
         self.stopper.set()
         self.thread.join()
 
+
     def listen(self):
         """
-        To run in thread, listen for events and call handle_buttons if applicable
+        To run in thread, listen for events and call handle_buttons if applicable.
         """
         with open(self.device, "rb") as in_file:
             event = in_file.read(EVENT_SIZE)
             while event and not self.stopper.is_set():
-                if self.stopper.is_set():
-                    break
-                (_sec, _usec, etype, code, value) = struct.unpack(EVENT_FORMAT, event)
-                # logger.info(f'Event: type: {etype}, code: {code}, value:{value}')
-                event_str = translate_event(etype, code, value)
-                if event_str in ['1', '2', '3', '4', 'm', 'ENTER', 'ESC', 'LEFT', 'RIGHT']:
-                    handle_button(event_str)
-                event = in_file.read(EVENT_SIZE)
+                try:
+                    (_sec, _usec, etype, code, value) = struct.unpack(EVENT_FORMAT, event)
+                    event_str = translate_event(etype, code, value)
+
+                    if event_str in ['1', '2', '3', '4', 'm', 'ENTER', 'ESC', 'LEFT', 'RIGHT']:
+                        current_time = time.time()
+
+                        # Check for double press
+                        if event_str in self.last_press_times:
+                            time_diff = current_time - self.last_press_times[event_str]
+                            if time_diff <= DOUBLE_PRESS_THRESHOLD:
+                                self.press_flags[event_str] = False  # Cancel pending single press
+                                logger.info(f'Double press detected for {event_str}')
+                                if event_str in ['LEFT', 'RIGHT']:
+                                    self.schedule_single_press(event_str, current_time)
+                                else:
+                                    handle_button_double_press(event_str)
+                            else:
+                                self.schedule_single_press(event_str, current_time)
+                        else:
+                            self.schedule_single_press(event_str, current_time)
+
+                        # Update last press time
+                        self.last_press_times[event_str] = current_time
+
+                    event = in_file.read(EVENT_SIZE)
+                except Exception as e:
+                    logger.error(f"Error in listener: {e}")
+                    time.sleep(1)
+
+    def schedule_single_press(self, button, current_time):
+        """
+        Schedule a single press with a small delay to allow for double-press detection.
+        """
+        self.press_flags[button] = True
+
+        def delayed_single_press():
+            time.sleep(DOUBLE_PRESS_THRESHOLD)
+            if self.press_flags.get(button, False):  # Check if single press is still valid
+                handle_button(button)
+
+        Thread(target=delayed_single_press, daemon=True).start()
 
 
 if __name__ == '__main__':
     # NOTE: we use no_ssl_verification context handler to nuke the obnoxiously difficult-to-disable SSL verification of requests
     logger.info('Starting buttons listeners')
+   
     with no_ssl_verification():
-        HA_CLIENT = Client(f'{HA_SERVER}/api', HA_TOKEN, global_request_kwargs={'verify': False}, cache_session=False)
+        HA_CLIENT = None
+        while HA_CLIENT == None:
+            try:
+                HA_CLIENT = Client(f'{HA_SERVER}/api', HA_TOKEN, global_request_kwargs={'verify': False}, cache_session=False)
+            except Exception as e:
+                print(e)
+                time.sleep(0.5)
+
         EventListener(DEV_BUTTONS)
         EventListener(DEV_KNOB)
+        # backlight_serivce()
+        Thread(target=backlight_serivce, daemon=True).start()
         while True:
             time.sleep(1)
