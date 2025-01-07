@@ -9,6 +9,7 @@ Buttons monitoring, to integrate with Home Assistant
 # https://github.com/maximehk/ha_lights/blob/main/ha_lights/ha_lights.py
 
 
+import json
 import subprocess
 import time
 import struct
@@ -30,6 +31,8 @@ from homeassistant_api import Client, State
 from buttons_settings import LEVEL_INCREMENT
 from buttons_settings import HA_SERVER, HA_TOKEN
 from buttons_settings import BUTTON1, BUTTON2, BUTTON3, BUTTON4, BUTTON5, BUTTON_ESC
+from mqtt_buttons import device_id, mqtt_port,entities, mqtt_host, mqtt_username, mqtt_password
+import paho.mqtt.client as mqtt
 
 # All the device buttons are part of event0, which appears as a keyboard
 # 	buttons along the edge are: 1, 2, 3, 4, m
@@ -216,7 +219,7 @@ def process_key(item):
         logger.info(f"Media control toggled: {media_ctrl}")
 
     
-def handle_button(pressed_key: str):
+def handle_button(client,pressed_key: str):
     """
     Decide what to do in response to a button press
     """
@@ -224,34 +227,41 @@ def handle_button(pressed_key: str):
     if pressed_key in ['1', '2', '3', '4', 'm']:
 
         if pressed_key == '1':
-            process_key(BUTTON1[0])
+            #process_key(BUTTON1[0])
+            single_press_button(client, "b1")
         if pressed_key == '2':
-            process_key(BUTTON2[0])
+            single_press_button(client, "b2")
         if pressed_key == '3':
-            process_key(BUTTON3[0])
+            single_press_button(client, "b3")
         if pressed_key == '4':
-            process_key(BUTTON4[0])
+            single_press_button(client, "b4")
         if pressed_key == 'm':
             toggle_backlight()
             #process_key(BUTTON5[0])
         
     elif pressed_key in ['ESC', 'ENTER', 'LEFT', 'RIGHT']:
         if pressed_key == 'ENTER':
-            if media_ctrl:
-                volume_mute()
-            else:
-                light_toggle(current_light)
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "single")
+            time.sleep(0.5)
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "off")
+            # if media_ctrl:
+            #     volume_mute()
+            # else:
+            #     light_toggle(current_light)
         elif pressed_key == 'LEFT':
-            cmd_lower()
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "left")
+            time.sleep(0.5)
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "off")
         elif pressed_key == 'RIGHT':
-            cmd_raise()
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "right")
+            time.sleep(0.5)
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "off")
         if pressed_key == 'ESC':
-            if media_ctrl:
-                play_pause()
-            else:
-                light_toggle(current_light)
+            publish(client, f"homeassistant/sensor/{device_id}/enter/state", "single")
+            time.sleep(0.5)
+            publish(client, f"homeassistant/sensor/{device_id}/enter/state", "off")
 
-def handle_button_double_press(pressed_key: str):
+def handle_button_double_press(client,pressed_key: str):
     """
     Decide what to do in response to a button press
     """
@@ -261,28 +271,30 @@ def handle_button_double_press(pressed_key: str):
     if pressed_key in ['1', '2', '3', '4', 'm']:
 
         if pressed_key == '1':
-            process_key(BUTTON1[1])
+            #process_key(BUTTON1[0])
+            double_press_button(client, "b1")
         if pressed_key == '2':
-            process_key(BUTTON2[1])
+            double_press_button(client, "b2")
         if pressed_key == '3':
-            process_key(BUTTON3[1])
+            double_press_button(client, "b3")
         if pressed_key == '4':
-            process_key(BUTTON4[1])
-        if pressed_key == 'm':
-            process_key(BUTTON5[1])
+            double_press_button(client, "b4")
+        if pressed_key == '5':
+            double_press_button(client, "b5")
         
     elif pressed_key in ['ESC', 'ENTER', 'LEFT', 'RIGHT']:
         if pressed_key == 'ENTER':
-            if media_ctrl:
-                pass #volume_mute()
-            else:
-                light_toggle(current_light)
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "double")
+            time.sleep(0.5)
+            publish(client, f"homeassistant/sensor/{device_id}/knob/state", "off")
         elif pressed_key == 'LEFT':
             cmd_lower()
         elif pressed_key == 'RIGHT':
             cmd_raise()
         if pressed_key == 'ESC':
-            process_key(BUTTON_ESC[1])
+            publish(client, f"homeassistant/sensor/{device_id}/enter/state", "double")
+            time.sleep(0.5)
+            publish(client, f"homeassistant/sensor/{device_id}/enter/state", "off")
 
 
 def get_media_player():
@@ -412,17 +424,60 @@ def cmd_raise():
     if new_level > current_level:
         set_light_level( new_level)
 
+def publish(client, topic, payload):
+            client.publish(topic=topic, payload=payload, qos=0, retain=False)
+
+def single_press_button(client, button):
+    publish(client, f"homeassistant/sensor/{device_id}/{button}/state", "single")
+    time.sleep(0.5)
+    publish(client, f"homeassistant/sensor/{device_id}/{button}/state", "off")
+
+def double_press_button(client, button):
+    publish(client, f"homeassistant/sensor/{device_id}/{button}/state", "double")
+    time.sleep(0.5)
+    publish(client, f"homeassistant/sensor/{device_id}/{button}/state", "off")
+
+def on_connect(client, userdata, flags, reason_code):
+            logger.info(f"Connected with result code {reason_code}")
+            
+            for entity in entities:
+                logger.info(entity)
+                logger.info(client.publish(topic=entity["topic"], payload=json.dumps(entity["payload"]), qos=0, retain=False))
+                time.sleep(0.5)
+
+            logger.info('Device created')
+
+            time.sleep(4)
+
+            # Init Briightness
+            client.publish(topic=f"homeassistant/sensor/{device_id}/brightness/state", payload=json.dumps(20), qos=0, retain=False)
+
+            # Init Buttons
+            for i in range(1,6):
+                client.publish(topic=f"homeassistant/sensor/{device_id}/b{i}/state", payload="off", qos=0, retain=False)
+            
+            client.publish(topic=f"homeassistant/sensor/{device_id}/enter/state", payload="off", qos=0, retain=False)
+            client.publish(topic=f"homeassistant/sensor/{device_id}/knob/state", payload="off", qos=0, retain=False)
+
+            
+            # Init current media & light
+            client.publish(topic=f"homeassistant/text/{device_id}/current_media/state", payload="media_player.lisa", qos=0, retain=False)
+            client.publish(topic=f"homeassistant/text/{device_id}/current_light/state", payload="light.bed_lights", qos=0, retain=False)
+            
+            time.sleep(1)
 
 class EventListener():
     """
     Listen to a specific /dev/eventX and call handle_button 
     """
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, client) -> None:
         self.device = device
+        self.client = client
         self.stopper = ThreadEvent()
         self.thread:Thread = None
         self.last_press_times = {}  # Store last press times for buttons
         self.press_flags = {}
+        
         self.start()
 
     def start(self):
@@ -441,11 +496,13 @@ class EventListener():
         self.stopper.set()
         self.thread.join()
 
+    
 
     def listen(self):
         """
         To run in thread, listen for events and call handle_buttons if applicable.
         """
+        
         with open(self.device, "rb") as in_file:
             event = in_file.read(EVENT_SIZE)
             while event and not self.stopper.is_set():
@@ -463,13 +520,13 @@ class EventListener():
                                 self.press_flags[event_str] = False  # Cancel pending single press
                                 logger.info(f'Double press detected for {event_str}')
                                 if event_str in ['LEFT', 'RIGHT']:
-                                    self.schedule_single_press(event_str, current_time)
+                                    self.schedule_single_press(client, event_str, current_time)
                                 else:
-                                    handle_button_double_press(event_str)
+                                    handle_button_double_press(client,event_str)
                             else:
-                                self.schedule_single_press(event_str, current_time)
+                                self.schedule_single_press(client,event_str, current_time)
                         else:
-                            self.schedule_single_press(event_str, current_time)
+                            self.schedule_single_press(client,event_str, current_time)
 
                         # Update last press time
                         self.last_press_times[event_str] = current_time
@@ -479,7 +536,7 @@ class EventListener():
                     logger.error(f"Error in listener: {e}")
                     time.sleep(1)
 
-    def schedule_single_press(self, button, current_time):
+    def schedule_single_press(self,client, button, current_time):
         """
         Schedule a single press with a small delay to allow for double-press detection.
         """
@@ -488,7 +545,7 @@ class EventListener():
         def delayed_single_press():
             time.sleep(DOUBLE_PRESS_THRESHOLD)
             if self.press_flags.get(button, False):  # Check if single press is still valid
-                handle_button(button)
+                handle_button(self.client,button)
 
         Thread(target=delayed_single_press, daemon=True).start()
 
@@ -505,10 +562,20 @@ if __name__ == '__main__':
             except Exception as e:
                 print(e)
                 time.sleep(0.5)
-
-        EventListener(DEV_BUTTONS)
-        EventListener(DEV_KNOB)
+        
+        client = mqtt.Client()
+        client.username_pw_set(mqtt_username, mqtt_password)
+        client.on_connect = on_connect
+        #client.on_message = on_message
+        
+        
+        client.connect(mqtt_host, mqtt_port)
+        EventListener(DEV_BUTTONS, client)
+        EventListener(DEV_KNOB, client)
+       
         # backlight_serivce()
         Thread(target=backlight_serivce, daemon=True).start()
+        
+        client.loop_forever()
         while True:
             time.sleep(1)
